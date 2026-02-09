@@ -13,7 +13,7 @@ from PIL import Image
 import pytesseract
 from huggingface_hub import InferenceClient
 from github import Github
-from playwright.sync_api import sync_playwright
+from curl_cffi import requests as cf_requests
 
 # --- CONFIG ---
 HF_TOKEN = os.environ.get("HF_TOKEN")
@@ -21,6 +21,9 @@ GITHUB_TOKEN = os.environ.get("MY_GITHUB_TOKEN")
 REPO_NAME = os.environ.get("GITHUB_REPOSITORY")
 MODEL_ID = "Qwen/Qwen2.5-72B-Instruct" 
 RSS_URL = "https://ntc.party/posts.rss"
+
+# TOR PROXY
+TOR_PROXY = "socks5://127.0.0.1:9050"
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -32,68 +35,33 @@ KEYWORDS = [
     "reality", "grpc", "ws", "tcp", "warp", "wireguard"
 ]
 
-class BrowserFetcher:
-    """Использует Playwright (Chromium) для прохождения JS-челленджа Cloudflare"""
-    
+class TorFetcher:
+    """Использует curl_cffi через локальный TOR прокси"""
     @staticmethod
-    def get_content(url, is_binary=False):
-        logger.info(f"Launching Browser for: {url}")
-        with sync_playwright() as p:
-            # Запускаем браузер с аргументами, скрывающими автоматизацию
-            browser = p.chromium.launch(
-                headless=True,
-                args=[
-                    '--disable-blink-features=AutomationControlled',
-                    '--no-sandbox',
-                    '--disable-setuid-sandbox'
-                ]
+    def get(url):
+        try:
+            # impersonate="chrome120" + Tor Proxy = Maximum Stealth
+            return cf_requests.get(
+                url, 
+                impersonate="chrome120", 
+                proxies={"http": TOR_PROXY, "https": TOR_PROXY},
+                timeout=40, # Тор медленный, увеличиваем таймаут
+                headers={
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                }
             )
-            # Эмулируем реальный десктоп
-            context = browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-                viewport={"width": 1920, "height": 1080}
-            )
-            page = context.new_page()
-            
-            try:
-                # Переходим на сайт
-                page.goto(url, timeout=60000, wait_until="domcontentloaded")
-                
-                # Ждем 5-10 секунд, пока Cloudflare крутит проверку "Just a moment..."
-                logger.info("Waiting for Cloudflare challenge...")
-                page.wait_for_timeout(8000) 
-                
-                # Если это картинка (бинарник), качаем через request context с куками
-                if is_binary:
-                    # Берем куки из страницы, которая прошла проверку
-                    cookies = context.cookies()
-                    # Формируем запрос
-                    response = page.request.get(url)
-                    if response.status == 200:
-                        return response.body() # Возвращаем bytes
-                    return None
-                
-                # Если это текст (RSS)
-                content = page.content()
-                
-                # Иногда Playwright возвращает HTML обертку вокруг XML. 
-                # Если мы видим, что content содержит RSS теги, но завернут в HTML, feedparser сам разберется.
-                return content
-                
-            except Exception as e:
-                logger.error(f"Browser Error: {e}")
-                return None
-            finally:
-                browser.close()
+        except Exception as e:
+            logger.error(f"Tor Network Error: {e}")
+            return None
 
 class OCRProcessor:
     @staticmethod
     def extract_text_from_image_url(url):
         try:
-            # Качаем картинку браузером, чтобы куки CF подцепились
-            image_bytes = BrowserFetcher.get_content(url, is_binary=True)
-            if image_bytes:
-                img = Image.open(BytesIO(image_bytes))
+            # Картинки тоже тянем через Тор
+            response = TorFetcher.get(url)
+            if response and response.status_code == 200:
+                img = Image.open(BytesIO(response.content))
                 text = pytesseract.image_to_string(img, lang='rus+eng')
                 return text
         except Exception as e:
@@ -172,26 +140,20 @@ class GitHubManager:
             return False
 
 def main():
-    logger.info("--- Starting Scraper (Browser Mode) ---")
+    logger.info("--- Starting Scraper (Tor Mode) ---")
     
-    # 1. RSS через Браузер
-    html_content = BrowserFetcher.get_content(RSS_URL)
+    # 1. RSS через TOR
+    resp = TorFetcher.get(RSS_URL)
     
-    if not html_content:
-        logger.error("Failed to load RSS via Browser")
+    if not resp or resp.status_code != 200:
+        logger.error(f"Failed to fetch RSS via Tor. Status: {getattr(resp, 'status_code', 'Unknown')}")
         return
 
-    # feedparser умеет искать RSS внутри HTML, если Cloudflare отдал страницу с XML внутри
-    feed = feedparser.parse(html_content)
+    # feedparser парсит контент, полученный через Tor
+    feed = feedparser.parse(resp.content)
     logger.info(f"Entries found: {len(feed.entries)}")
     
-    if len(feed.entries) == 0:
-        logger.warning("No entries found. Maybe Cloudflare is still blocking or structure changed.")
-        # Логгируем первые 500 символов, чтобы понять, что вернулось (HTML капчи?)
-        logger.info(f"Content preview: {str(html_content)[:500]}")
-        return
-
-    for entry in feed.entries[:10]: # Берем последние 10
+    for entry in feed.entries[:15]: 
         try:
             guid = entry.get('id', entry.get('link'))
             logger.info(f"Processing: {entry.title}")
@@ -218,7 +180,7 @@ def main():
             if result and result.get('type') != 'GARBAGE':
                 result['source_url'] = entry.link
                 gh = GitHubManager()
-                meta = { "guid": guid, "date": datetime.now().isoformat(), "host": "GH Actions + Playwright" }
+                meta = { "guid": guid, "date": datetime.now().isoformat(), "host": "GH Actions + Tor" }
                 gh.save_data(result, meta)
                 
             time.sleep(2)
