@@ -1,8 +1,9 @@
-playwright
 feedparser
 beautifulsoup4
 pytesseract
 Pillow
 huggingface_hub
 PyGithub
+curl_cffi
 lxml
+pysocks
