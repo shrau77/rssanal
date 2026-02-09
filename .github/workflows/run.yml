@@ -1,4 +1,4 @@
-name: NTC Scraper (Proxy Roulette)
+name: NTC Scraper (Browser Mode)
 
 on:
   schedule:
@@ -26,7 +26,10 @@ jobs:
           python-version: '3.10'
 
       - name: Install Python Libraries
-        run: pip install -r requirements.txt
+        run: |
+          pip install -r requirements.txt
+          playwright install chromium
+          playwright install-deps
 
       - name: Run Scraper
         env:
