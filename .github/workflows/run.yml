@@ -1,9 +1,9 @@
-name: NTC Scraper (WARP Mode)
+name: NTC Scraper (Proxy Roulette)
 
 on:
   schedule:
-    - cron: '0 */2 * * *' # Каждые 2 часа
-  workflow_dispatch:      # Кнопка ручного запуска
+    - cron: '0 */2 * * *'
+  workflow_dispatch:
 
 jobs:
   scrape:
@@ -15,25 +15,6 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # ==================================================
-      # 🛡️ КОЛХОЗИМ WARP (ОБХОД БАНА ПО IP)
-      # ==================================================
-      - name: Install Cloudflare WARP
-        uses: fscarmen/warp-on-actions@v1.2
-        with:
-          stack: ipv4 # Принудительно IPv4, чтобы не было путаницы
-
-      - name: Check Network (Debug)
-        run: |
-          echo "Public IP after WARP:"
-          curl -s https://ifconfig.me
-          echo ""
-          echo "Trying to reach ntc.party..."
-          curl -I https://ntc.party || echo "Curl check failed (it's ok if python handles it)"
-
-      # ==================================================
-      # ⚙️ ОБЫЧНАЯ НАСТРОЙКА ОКРУЖЕНИЯ
-      # ==================================================
       - name: Install System Dependencies
         run: |
           sudo apt-get update
@@ -51,6 +32,4 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           MY_GITHUB_TOKEN: ${{ secrets.MY_GITHUB_TOKEN }}
-          # Если скрипт падает на SSL внутри WARP, можно отключить проверку (не рекомендуется, но работает)
-          # CURL_CA_BUNDLE: "" 
         run: python scraper.py
