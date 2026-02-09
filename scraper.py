@@ -4,18 +4,16 @@ import uuid
 import time
 import logging
 import re
-import random
 from io import BytesIO
 from datetime import datetime
 
 import feedparser
-import requests
 from bs4 import BeautifulSoup
 from PIL import Image
 import pytesseract
 from huggingface_hub import InferenceClient
 from github import Github
-from curl_cffi import requests as cf_requests
+from playwright.sync_api import sync_playwright
 
 # --- CONFIG ---
 HF_TOKEN = os.environ.get("HF_TOKEN")
@@ -23,13 +21,6 @@ GITHUB_TOKEN = os.environ.get("MY_GITHUB_TOKEN")
 REPO_NAME = os.environ.get("GITHUB_REPOSITORY")
 MODEL_ID = "Qwen/Qwen2.5-72B-Instruct" 
 RSS_URL = "https://ntc.party/posts.rss"
-
-# Списки живых прокси (HTTP/HTTPS)
-PROXY_SOURCES = [
-    "https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/http.txt",
-    "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
-    "https://raw.githubusercontent.com/zloi-user/hideip.me/main/http.txt"
-]
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -41,81 +32,68 @@ KEYWORDS = [
     "reality", "grpc", "ws", "tcp", "warp", "wireguard"
 ]
 
-class ProxyManager:
-    """Менеджер для поиска живого прокси"""
-    def __init__(self):
-        self.proxies = []
-
-    def fetch_proxies(self):
-        logger.info("Fetching fresh proxies...")
-        for source in PROXY_SOURCES:
-            try:
-                r = requests.get(source, timeout=10)
-                if r.status_code == 200:
-                    lines = r.text.strip().split('\n')
-                    logger.info(f"Loaded {len(lines)} proxies from {source}")
-                    self.proxies.extend(lines)
-            except Exception as e:
-                logger.error(f"Error fetching proxy list: {e}")
-        
-        # Перемешиваем, чтобы не брать одни и те же
-        random.shuffle(self.proxies)
-        self.proxies = list(set(self.proxies)) # Удаляем дубли
-        logger.info(f"Total unique proxies to try: {len(self.proxies)}")
-
-    def get_working_session(self, test_url):
-        """Перебирает прокси, пока не найдет рабочий для curl_cffi"""
-        # Сначала пробуем без прокси (вдруг повезет?)
-        try:
-            logger.info("Trying direct connection...")
-            sess = cf_requests.Session(impersonate="chrome120")
-            resp = sess.get(test_url, timeout=10)
-            if resp.status_code == 200:
-                logger.info("Direct connection worked!")
-                return sess
-        except Exception:
-            logger.info("Direct connection failed. Starting Proxy Roulette...")
-
-        # Пробуем прокси
-        # Ограничим попытки, чтобы не висеть вечно (например, 20 попыток)
-        max_tries = 30
-        for i, proxy_addr in enumerate(self.proxies[:max_tries]):
-            proxy_url = f"http://{proxy_addr.strip()}"
-            logger.info(f"[{i+1}/{max_tries}] Testing proxy: {proxy_url}")
+class BrowserFetcher:
+    """Использует Playwright (Chromium) для прохождения JS-челленджа Cloudflare"""
+    
+    @staticmethod
+    def get_content(url, is_binary=False):
+        logger.info(f"Launching Browser for: {url}")
+        with sync_playwright() as p:
+            # Запускаем браузер с аргументами, скрывающими автоматизацию
+            browser = p.chromium.launch(
+                headless=True,
+                args=[
+                    '--disable-blink-features=AutomationControlled',
+                    '--no-sandbox',
+                    '--disable-setuid-sandbox'
+                ]
+            )
+            # Эмулируем реальный десктоп
+            context = browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+                viewport={"width": 1920, "height": 1080}
+            )
+            page = context.new_page()
             
             try:
-                sess = cf_requests.Session(impersonate="chrome120")
-                sess.proxies = {"http": proxy_url, "https": proxy_url}
+                # Переходим на сайт
+                page.goto(url, timeout=60000, wait_until="domcontentloaded")
                 
-                # Тестовый запрос
-                resp = sess.get(test_url, timeout=15)
+                # Ждем 5-10 секунд, пока Cloudflare крутит проверку "Just a moment..."
+                logger.info("Waiting for Cloudflare challenge...")
+                page.wait_for_timeout(8000) 
                 
-                if resp.status_code == 200:
-                    logger.info(f"🎉 SUCCESS! Found working proxy: {proxy_url}")
-                    return sess
-                else:
-                    logger.warning(f"Proxy returned status {resp.status_code}")
-            
+                # Если это картинка (бинарник), качаем через request context с куками
+                if is_binary:
+                    # Берем куки из страницы, которая прошла проверку
+                    cookies = context.cookies()
+                    # Формируем запрос
+                    response = page.request.get(url)
+                    if response.status == 200:
+                        return response.body() # Возвращаем bytes
+                    return None
+                
+                # Если это текст (RSS)
+                content = page.content()
+                
+                # Иногда Playwright возвращает HTML обертку вокруг XML. 
+                # Если мы видим, что content содержит RSS теги, но завернут в HTML, feedparser сам разберется.
+                return content
+                
             except Exception as e:
-                # Ошибки соединения игнорируем, просто идем к следующему
-                pass
-        
-        raise Exception("All proxies failed. Cloudflare won today.")
-
-# Глобальная сессия
-proxy_manager = ProxyManager()
-proxy_manager.fetch_proxies()
-# Инициализируем сессию один раз
-global_session = proxy_manager.get_working_session(RSS_URL)
+                logger.error(f"Browser Error: {e}")
+                return None
+            finally:
+                browser.close()
 
 class OCRProcessor:
     @staticmethod
     def extract_text_from_image_url(url):
         try:
-            # Используем ту же сессию (тот же прокси) для картинок
-            response = global_session.get(url, timeout=20)
-            if response and response.status_code == 200:
-                img = Image.open(BytesIO(response.content))
+            # Качаем картинку браузером, чтобы куки CF подцепились
+            image_bytes = BrowserFetcher.get_content(url, is_binary=True)
+            if image_bytes:
+                img = Image.open(BytesIO(image_bytes))
                 text = pytesseract.image_to_string(img, lang='rus+eng')
                 return text
         except Exception as e:
@@ -194,18 +172,26 @@ class GitHubManager:
             return False
 
 def main():
-    logger.info("--- Starting Scraper (Proxy Mode) ---")
+    logger.info("--- Starting Scraper (Browser Mode) ---")
     
-    # 1. RSS через найденный прокси
-    try:
-        resp = global_session.get(RSS_URL, timeout=30)
-        feed = feedparser.parse(resp.content)
-        logger.info(f"Entries found: {len(feed.entries)}")
-    except Exception as e:
-        logger.error(f"Fatal: Could not fetch RSS even with proxies. {e}")
+    # 1. RSS через Браузер
+    html_content = BrowserFetcher.get_content(RSS_URL)
+    
+    if not html_content:
+        logger.error("Failed to load RSS via Browser")
         return
 
-    for entry in feed.entries[:15]: 
+    # feedparser умеет искать RSS внутри HTML, если Cloudflare отдал страницу с XML внутри
+    feed = feedparser.parse(html_content)
+    logger.info(f"Entries found: {len(feed.entries)}")
+    
+    if len(feed.entries) == 0:
+        logger.warning("No entries found. Maybe Cloudflare is still blocking or structure changed.")
+        # Логгируем первые 500 символов, чтобы понять, что вернулось (HTML капчи?)
+        logger.info(f"Content preview: {str(html_content)[:500]}")
+        return
+
+    for entry in feed.entries[:10]: # Берем последние 10
         try:
             guid = entry.get('id', entry.get('link'))
             logger.info(f"Processing: {entry.title}")
@@ -232,7 +218,7 @@ def main():
             if result and result.get('type') != 'GARBAGE':
                 result['source_url'] = entry.link
                 gh = GitHubManager()
-                meta = { "guid": guid, "date": datetime.now().isoformat(), "host": "GH Actions + Proxy" }
+                meta = { "guid": guid, "date": datetime.now().isoformat(), "host": "GH Actions + Playwright" }
                 gh.save_data(result, meta)
                 
             time.sleep(2)
