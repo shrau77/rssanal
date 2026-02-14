@@ -1,0 +1,20 @@
+{
+  "meta": {
+    "guid": "ntc.party-post-121827",
+    "date": "2026-02-14T08:27:18.088979",
+    "host": "GH Actions + Tor"
+  },
+  "data": {
+    "type": "CONFIG",
+    "region": null,
+    "provider": null,
+    "config": "!@new --filter-udp=* $#%filter-l7=wireguard,stun,discord,mtproto\n^%out-range=-n1\n&^payload=wireguard_initiation,wireguard_response,wireguard_cookie,stun,discord_ip_discovery,mtproto_initial\n&%lua-desync=fake:blob=quic_google:repeats=6\n^*new --filter-udp=* $^^filter-l7=wireguard,stun,discord,mtproto\n^-out-range=-d3\n-%payload=wireguard_initiation,wireguard_response,wireguard_cookie,stun,discord_ip_discovery,mtproto_initial\n$:lua-desync=fake:blob=quic_google:repeats=6",
+    "cosmetics": {
+      "fragment": null,
+      "mtu": null,
+      "noise": null
+    },
+    "summary": "Конфигурации для WireGuard и других протоколов с различными фильтрами и payload.",
+    "source_url": "https://ntc.party/t/zapret2-%D0%BE%D0%B1%D1%81%D1%83%D0%B6%D0%B4%D0%B5%D0%BD%D0%B8%D0%B5/21161?page=34#post_680"
+  }
+}
